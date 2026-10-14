@@ -1,13 +1,22 @@
-# CUDA Inference Kernels: Optimization Lab
+# CUDA Inference Kernels
 
-Four float32 operators are implemented in plain C++/CUDA, each with a deliberately simple baseline and two GPU-oriented variants:
+Four float32 operators are implemented in plain C++/CUDA, each with a deliberately simple baseline and two GPU-oriented variants. The goal is to make the exact math of each operator obvious while comparing naive, tiled, and vectorized implementations.
+
+## What each kernel computes
+
+- Matmul: multiplies two matrices A and B to form C = A @ B. In this project, A is `[M, K]`, B is `[K, N]`, and each output element is the dot product of one row of A with one column of B. This is the core GEMM pattern used by attention and MLP layers.
+- Conv2D: performs a valid single-channel 3x3 convolution with no padding and stride 1. Each output pixel is the sum of the 3x3 input neighborhood multiplied by the 3x3 filter weights, so the output size is `(H - 2) x (W - 2)` for an input `H x W`.
+- Softmax: applies the standard row-wise softmax across the last dimension. For each row, it subtracts the maximum value for numerical stability, exponentiates the shifted values, then normalizes by their sum so the row sums to 1.
+- LayerNorm: normalizes each row independently along the last dimension. It computes the row mean and variance, then applies `(x - mean) / sqrt(variance + 1e-5)`. This keeps activations centered and scaled without using learned affine parameters.
+
+## Implementation variants
 
 | Operator | Naive | Tiled | Vectorized |
 | --- | --- | --- | --- |
-| Matmul | One thread per output; rereads global-memory operands | Reuses input tiles from shared memory | Computes four adjacent output columns per thread and uses aligned `float4` loads/stores when possible |
-| Conv2D | One thread per valid output of a single-channel 3x3 convolution | Reuses the input patch and halo in shared memory | Computes four adjacent outputs per thread and stores a `float4` when aligned |
-| Softmax | One thread processes a complete row | One block per row with warp/block reductions | Processes four contiguous values per thread with vector loads/stores and block reductions |
-| LayerNorm | One thread processes a complete row | One block per row with parallel mean/variance reductions | Four-value vector loads/stores with parallel reductions |
+| Matmul | One thread per output element; each thread loops over the K dimension and rereads global-memory operands | Each block loads a tile of A and B into shared memory, then reuses those tiles across the dot-product accumulation | Computes four adjacent output columns per thread and uses aligned `float4` loads/stores when possible |
+| Conv2D | One thread per valid output pixel; each thread walks the 3x3 window directly from global memory | Each block cooperatively loads an input tile plus halo into shared memory, then computes the convolution from that tile | Computes four neighboring output pixels per thread and stores a `float4` when aligned |
+| Softmax | One thread processes a complete row by scanning all columns and computing max/denominator in sequence | One block per row uses shared-memory reductions to compute the row max and denominator in parallel | Processes four contiguous values per thread with vector loads and a shared-memory reduction for the row-wise normalization |
+| LayerNorm | One thread processes a complete row by computing the mean and variance in a scalar loop | One block per row computes mean and variance with parallel reductions in shared memory | Four-value vector loads/stores and parallel reductions compute the same normalization more efficiently |
 
 The conv operator is valid (no padding), stride 1, and single-channel. Softmax and layernorm operate on the last dimension; layernorm uses epsilon `1e-5` and no learned scale/bias. These are teaching kernels, not replacements for cuBLAS/cuDNN or production inference libraries.
 
@@ -34,3 +43,5 @@ The executable first checks every result against a CPU reference. It then warms 
 The progression tests three distinct sources of throughput. Tiling should help matmul and convolution by reusing data loaded from global memory. Row-wise softmax and layernorm benefit from distributing reductions across a block instead of assigning a whole row to one thread. The vectorized versions process adjacent values together and use 128-bit memory operations where alignment allows; they can reduce instruction overhead, but are not guaranteed to win when an operator is already bandwidth-bound or the workload is small.
 
 After running in Colab, copy the printed per-operator speedups into your report and include the GPU model printed by the executable. Report the measured latency as well as speedup, since a large ratio on a very slow baseline can obscure the absolute runtime. There are intentionally no pre-filled speedup claims: no GPU benchmark has been run for this repository yet.
+
+
